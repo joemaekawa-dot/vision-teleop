@@ -1,0 +1,13 @@
+# Python environments (large; recreate locally)
+.venv/
+**/.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# logs / backups / scratch
+*.log
+*.bak
+*.bak2
+*.tmp
+.DS_Store
