@@ -246,9 +246,17 @@ def main():
                         cv2.putText(dd, "DEPTH (monocular)", (12, 30),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                         disp = cv2.hconcat([disp, dd])
+                    sx, sy, sz = retarget.signs()
+                    sgn = f"signs X{'+' if sx > 0 else '-'} Y{'+' if sy > 0 else '-'} Z{'+' if sz > 0 else '-'}"
+                    cv2.putText(disp, f"{sgn}   (x/y/z flip axis, ESC quit)",
+                                (12, disp.shape[0] - 14), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.55, (0, 255, 255), 2)
                     cv2.imshow("vision-teleop", disp)
-                if (cv2.waitKey(15) & 0xFF) == 27:   # ~66 Hz GUI cap, ESC to quit
+                k = cv2.waitKey(15) & 0xFF           # ~66 Hz GUI cap
+                if k == 27:                          # ESC quit
                     shared.stop = True
+                elif k in (ord('x'), ord('y'), ord('z')):
+                    retarget.flip(chr(k))            # live-flip an axis direction
             th.join(timeout=2)
     finally:
         shared.stop = True

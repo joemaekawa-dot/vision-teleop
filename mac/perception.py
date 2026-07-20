@@ -164,9 +164,12 @@ class HandTracker:
         x_axis = _unit(np.cross(y_axis, z_axis))
         quat = _mat_to_quat(np.column_stack([x_axis, y_axis, z_axis]))
 
-        # --- position: INDEX FINGERTIP (EE point) image XY + size depth axis ---
-        cx = float(px[INDEX_TIP][0])
-        cy = float(px[INDEX_TIP][1])
+        # --- position: INDEX-FINGER MCP (knuckle) image XY + size depth axis ---
+        # Use the MCP (landmark 5), not the tip: the knuckle barely moves when the
+        # thumb-index pinch opens/closes, so gripper actuation no longer drags the
+        # arm's X,Y (decoupled). It still tracks "the index finger's position".
+        cx = float(px[INDEX_MCP][0])
+        cy = float(px[INDEX_MCP][1])
         # gain centers on the frame middle, amplifies, then clips to [-1,1] so a
         # comfortable hand travel reaches the full workspace (wider effective x,y)
         xn = _clip_unit(2 * (cx / w - 0.5) * self.xy_gain)

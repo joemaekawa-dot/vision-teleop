@@ -75,7 +75,20 @@ class Retargeter:
         self._fz = OneEuro(mincutoff=1.7, beta=0.05)
         self._fg = OneEuro(mincutoff=2.0, beta=0.01)
         self._q = None
-        self._ref = None   # calibrated index-fingertip origin (camera frame, m)
+        self._ref = None   # calibrated origin (index-MCP screen pos)
+        # live-tunable axis signs (flip at runtime with the x/y/z keys)
+        self.sgn_x, self.sgn_y, self.sgn_z = SGN_X, SGN_Y, SGN_Z
+
+    def flip(self, axis: str):
+        if axis == "x":
+            self.sgn_x = -self.sgn_x
+        elif axis == "y":
+            self.sgn_y = -self.sgn_y
+        elif axis == "z":
+            self.sgn_z = -self.sgn_z
+
+    def signs(self):
+        return (self.sgn_x, self.sgn_y, self.sgn_z)
 
     def relative_eeframe(self, hs, t_s, tracking: bool,
                          just_calibrated: bool, gripper: float) -> EEFrame:
@@ -93,9 +106,9 @@ class Retargeter:
         dx = _c1(p[0] - self._ref[0])    # screen offset, clipped -> predictable max range
         dy = _c1(p[1] - self._ref[1])
         dz = _deadzone(_c1(p[2] - self._ref[2]), DEPTH_DEAD)  # ignore small depth wobble
-        ee_x = self._fx(SGN_X * dy * REACH_HALF, t_s)   # screen up/down -> fwd/back (X)
-        ee_y = self._fy(SGN_Y * dx * REACH_HALF, t_s)   # screen L/R     -> L/R (Y)
-        ee_z = self._fz(SGN_Z * dz * VERT_HALF, t_s)    # closer         -> DOWN (-Z)
+        ee_x = self._fx(self.sgn_x * dy * REACH_HALF, t_s)  # screen up/down -> fwd/back (X)
+        ee_y = self._fy(self.sgn_y * dx * REACH_HALF, t_s)  # screen L/R     -> L/R (Y)
+        ee_z = self._fz(self.sgn_z * dz * VERT_HALF, t_s)   # closer         -> DOWN (-Z)
         return EEFrame(pos=(ee_x, ee_y, ee_z), gripper=g, confidence=hs.confidence,
                        flags=FLAG_VALID | FLAG_ENABLED | FLAG_CALIBRATED)
 
