@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from dataclasses import dataclass, field
 
+import cv2
 import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
@@ -37,13 +39,15 @@ FINGER_PIPS = [6, 10, 14, 18]
 
 @dataclass
 class HandState:
-    pos: tuple             # normalized x,y,z ~[-1,1]
+    pos: tuple             # normalized x,y,z ~[-1,1] (legacy planar path)
     quat: tuple            # palm orientation w,x,y,z
     gripper: float         # 0=closed .. 1=open (pinch)
     openness: float        # 0=fist .. 1=open hand (for gesture)
     handedness: str
     confidence: float
     landmarks_px: list = field(default_factory=list)
+    pinch: float = 0.0                     # raw thumb-tip↔index-tip / hand_scale
+    fingers_ext: tuple = (False,) * 5      # extended? [thumb,index,middle,ring,pinky]
 
 
 def _mat_to_quat(R):
@@ -96,9 +100,10 @@ class HeuristicDepth:
 class HandTracker:
     def __init__(self, target="Right", mirror=True, depth=None,
                  min_det=0.6, min_track=0.5, model_path=None,
-                 swap_handedness=False, xy_gain=1.6):
+                 swap_handedness=False, xy_gain=1.6, hfov_deg=60.0):
         self.target = target
         self.mirror = mirror
+        self._hfov = hfov_deg   # for the solvePnP camera matrix (approx)
         # Handedness is DECOUPLED from the position mirror. MediaPipe reports
         # handedness assuming a selfie-mirrored image; the AVFoundation raw
         # buffer is NOT mirrored, but empirically this pipeline already labels
@@ -137,8 +142,11 @@ class HandTracker:
         h, w = frame_bgr.shape[:2]
         rgb = np.ascontiguousarray(frame_bgr[:, :, ::-1])
         mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        self._ts_ms += 33
-        res = self.hands.detect_for_video(mp_img, self._ts_ms)
+        ts = int(time.monotonic() * 1000)        # real cadence (not a fixed 33ms)
+        if ts <= self._ts_ms:                     # keep strictly increasing
+            ts = self._ts_ms + 1
+        self._ts_ms = ts
+        res = self.hands.detect_for_video(mp_img, ts)
         picked = self._pick(res)
         if picked is None:
             return None
@@ -156,9 +164,9 @@ class HandTracker:
         x_axis = _unit(np.cross(y_axis, z_axis))
         quat = _mat_to_quat(np.column_stack([x_axis, y_axis, z_axis]))
 
-        # --- position: image XY (mirror-corrected) + depth forward axis ---
-        cx = sum(px[i][0] for i in (0, 5, 9, 13, 17)) / 5.0
-        cy = sum(px[i][1] for i in (0, 5, 9, 13, 17)) / 5.0
+        # --- position: INDEX FINGERTIP (EE point) image XY + size depth axis ---
+        cx = float(px[INDEX_TIP][0])
+        cy = float(px[INDEX_TIP][1])
         # gain centers on the frame middle, amplifies, then clips to [-1,1] so a
         # comfortable hand travel reaches the full workspace (wider effective x,y)
         xn = _clip_unit(2 * (cx / w - 0.5) * self.xy_gain)
@@ -169,20 +177,41 @@ class HandTracker:
                              px[MIDDLE_MCP][1] - px[WRIST][1])
         zn = self.depth.z_norm(size_px, frame=frame_bgr, uv=(cx, cy))
 
-        # --- gripper (pinch) & openness (fist) from world coords ---
+        # --- pinch, per-finger extension, openness from world coords ---
         hand_scale = np.linalg.norm(W[MIDDLE_MCP] - W[WRIST]) or 1e-3
-        pinch = np.linalg.norm(W[THUMB_TIP] - W[INDEX_TIP]) / hand_scale
-        gripper = float(max(0.0, min(1.0, (pinch - 0.3) / 1.2)))
-        ext = 0
-        for tip, pip in zip(FINGER_TIPS, FINGER_PIPS):
-            if np.linalg.norm(W[tip] - W[WRIST]) > np.linalg.norm(W[pip] - W[WRIST]):
-                ext += 1
-        openness = ext / len(FINGER_TIPS)
+        pinch = float(np.linalg.norm(W[THUMB_TIP] - W[INDEX_TIP]) / hand_scale)
+        gripper = float(max(0.0, min(1.0, (pinch - 0.3) / 1.2)))   # legacy fallback
+        # extended? [thumb, index, middle, ring, pinky]
+        _tips, _pips = (4, 8, 12, 16, 20), (3, 6, 10, 14, 18)
+        fingers_ext = tuple(
+            np.linalg.norm(W[t] - W[WRIST]) > np.linalg.norm(W[p] - W[WRIST])
+            for t, p in zip(_tips, _pips))
+        openness = sum(fingers_ext[1:]) / 4.0     # 4 non-thumb fingers
 
         conf = score * (0.7 if getattr(self.depth, "approximate", True) else 1.0)
         return HandState(pos=(xn, yn, zn), quat=quat, gripper=gripper,
                          openness=openness, handedness=self.target,
-                         confidence=float(conf), landmarks_px=px)
+                         confidence=float(conf), landmarks_px=px,
+                         pinch=pinch, fingers_ext=fingers_ext)
+
+    def _fingertip_cam(self, W, px, w, h):
+        """Metric-ish index-fingertip position in the camera frame (meters) via
+        solvePnP over the 21 landmarks (3D metric model = MediaPipe world
+        landmarks, 2D = image pixels). Approx camera matrix from HFOV — fine for
+        RELATIVE control (deltas), where absolute scale is absorbed by the gain."""
+        f = (w / 2) / math.tan(math.radians(self._hfov) / 2)
+        K = np.array([[f, 0, w / 2.0], [0, f, h / 2.0], [0, 0, 1]], dtype=np.float64)
+        obj = np.ascontiguousarray(W, dtype=np.float64)          # 21x3 (hand frame, m)
+        img = np.ascontiguousarray(px, dtype=np.float64)         # 21x2 (pixels)
+        try:
+            ok, rvec, tvec = cv2.solvePnP(obj, img, K, None, flags=cv2.SOLVEPNP_SQPNP)
+        except Exception:
+            ok = False
+        if not ok:
+            return (0.0, 0.0, 0.0)
+        R, _ = cv2.Rodrigues(rvec)
+        p = (R @ W[INDEX_TIP].reshape(3, 1) + tvec).ravel()      # fingertip in cam frame
+        return (float(p[0]), float(p[1]), float(p[2]))
 
     def close(self):
         self.hands.close()

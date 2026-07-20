@@ -86,7 +86,10 @@ class Controller:
             return dict(self.home), "home"
         if not f.enabled:                          # deadman released
             return dict(self.cmd), "deadman"
-        return self.adapter.retarget(f), "track"
+        raw = self.adapter.retarget(f)
+        if raw is None:                            # IK unreachable -> HOLD (no home yank)
+            return dict(self.cmd), "unreach"
+        return raw, "track"
 
     def _home_arm(self, period, secs=5.0):
         """Actively slew to HOME (incl. opening the gripper) before tracking.

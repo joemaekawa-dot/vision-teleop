@@ -81,14 +81,20 @@ class FeetechBus:
             w.addParam(i, [SCS_LOBYTE(tick), SCS_HIBYTE(tick)])
         w.txPacket()
 
-    def enable_torque(self, on: bool):
-        """F4: check every servo. Enabling that fails on ANY servo aborts to
-        all-off and raises. Disabling that fails leaves torque_on True so callers
-        never believe a still-energized arm is limp."""
+    def enable_torque(self, on: bool, retries: int = 4):
+        """Set torque on every servo, RETRYING transient serial glitches per servo
+        (Feetech writes occasionally NAK). Only a servo that fails all retries is a
+        real fault. Enabling that still fails on any servo aborts to all-off and
+        raises; disabling that fails leaves torque_on True (never claim limp falsely)."""
         failed = []
         for i in self.ids:
-            comm, _ = self.ph.write1ByteTxRx(self.port, i, ADDR_TORQUE_ENABLE, 1 if on else 0)
-            if comm != COMM_SUCCESS:
+            ok = False
+            for _ in range(retries):
+                comm, _ = self.ph.write1ByteTxRx(self.port, i, ADDR_TORQUE_ENABLE, 1 if on else 0)
+                if comm == COMM_SUCCESS:
+                    ok = True
+                    break
+            if not ok:
                 failed.append(i)
         if on:
             if failed:

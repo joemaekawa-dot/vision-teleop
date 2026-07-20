@@ -20,6 +20,7 @@ import math
 
 from eeframe import EEFrame
 from embodiment import EmbodimentAdapter
+from kinematics import ik, clamp_target, angles_to_ticks, home_ee, HOME_ANGLES
 
 # per-axis authority in ticks (kept inside the safety window; tune from URDF).
 # Widened for a broader x,y workspace so the EE tracks a larger hand travel.
@@ -59,6 +60,7 @@ class SO101Adapter(EmbodimentAdapter):
 
     def __init__(self, home: dict[int, int]):
         self._home = dict(home)
+        self._home_ee, self._ee_pitch = home_ee()   # relative-control origin
 
     @property
     def ids(self):
@@ -67,21 +69,40 @@ class SO101Adapter(EmbodimentAdapter):
     def home_ticks(self):
         return dict(self._home)
 
+    def _gripper_tick(self, g):
+        return int(GRIP_CLOSED + _clip(g, 0.0, 1.0) * (GRIP_OPEN - GRIP_CLOSED))
+
     def retarget(self, frame: EEFrame) -> dict[int, int]:
+        if not frame.calibrated:
+            return self._planar(frame)          # legacy fallback (non-calibrated)
+        # IK path: EE target = home EE + relative delta (m, base frame)
+        dx, dy, dz = frame.pos
+        tgt = (self._home_ee[0] + dx, self._home_ee[1] + dy, self._home_ee[2] + dz)
+        # saturate beyond-reach targets at the arm's limit (max-range, no stall)
+        tgt = clamp_target(tgt[0], tgt[1], tgt[2], self._ee_pitch)
+        sol = ik(tgt[0], tgt[1], tgt[2], self._ee_pitch)
+        if sol is None:
+            return None            # unreachable -> controller HOLDS current pose (no home yank)
+        pan, a2, a3, a4 = sol
+        goals = dict(self._home)
+        goals.update(angles_to_ticks(pan, a2, a3, a4, HOME_ANGLES["roll"], self._home))
+        goals[6] = self._gripper_tick(frame.gripper)
+        return goals
+
+    def _planar(self, frame: EEFrame) -> dict[int, int]:
         h = self._home
         px, py, pz = frame.pos
         pitch, roll = _quat_to_pitch_roll(frame.quat)
-        g = _clip(frame.gripper, 0.0, 1.0)
         return {
             1: int(h[1] + _clip(px) * SPAN_PAN),
             2: int(h[2] - _clip(py) * SPAN_LIFT),
             3: int(h[3] + _clip(pz) * SPAN_ELBOW),
             4: int(h[4] + _clip(pitch / (math.pi / 2)) * SPAN_WFLEX),
             5: int(h[5] + _clip(roll / math.pi) * SPAN_WROLL),
-            6: int(GRIP_CLOSED + g * (GRIP_OPEN - GRIP_CLOSED)),  # g=1 open..g=0 closed
+            6: self._gripper_tick(frame.gripper),
         }
 
     def capabilities(self):
         return {"name": self.name, "dof": 5, "gripper": True,
                 "dropped_dof": "end-effector yaw (coupled to base azimuth)",
-                "mapping": "mvp-bounded-workspace (not metric IK)"}
+                "mapping": "relative-cartesian IK (index-fingertip EE)"}

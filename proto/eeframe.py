@@ -35,6 +35,7 @@ MAX_FRAMES_PER_PACKET = 3
 FLAG_VALID = 1 << 0
 FLAG_ENABLED = 1 << 1
 FLAG_HOME = 1 << 2
+FLAG_CALIBRATED = 1 << 3   # pos carries a RELATIVE EE delta (m) from the calib origin
 
 _FRAME = struct.Struct("<IQ3f4fffI")        # seq,ts,pos3,quat4,grip,conf,flags
 FRAME_SIZE = _FRAME.size                     # 52 bytes
@@ -73,6 +74,10 @@ class EEFrame:
     @property
     def home(self) -> bool:
         return bool(self.flags & FLAG_HOME)
+
+    @property
+    def calibrated(self) -> bool:
+        return bool(self.flags & FLAG_CALIBRATED)
 
     def pack_into(self, buf: bytearray, offset: int) -> int:
         _FRAME.pack_into(

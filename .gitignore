@@ -5,6 +5,9 @@ __pycache__/
 *.pyc
 *.pyo
 
+# large re-downloadable model weights (Depth Anything V2 ~97MB); see README to fetch
+mac/models/*.onnx
+
 # logs / backups / scratch
 *.log
 *.bak

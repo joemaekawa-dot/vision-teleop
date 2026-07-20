@@ -23,7 +23,7 @@ import cv2
 
 from camera import open_camera
 from perception import HandTracker
-from gestures import FistHold
+from gestures import CalibrationFSM
 from retarget import Retargeter
 from eeframe import EEFrame, FLAG_VALID
 
@@ -35,25 +35,34 @@ class Shared:
         self.frame = None
         self.hs = None
         self.prog = 0.0
-        self.home = False
+        self.status = "no hand"
         self.rate = 0.0
         self.frames = 0
         self.hands = 0
+        self.depth = None      # colourised depth map (BGR), from the depth thread
         self.stop = False
 
-    def publish(self, frame, hs, prog, home, rate, frames, hands):
+    def set_depth(self, d):
+        with self.lock:
+            self.depth = d
+
+    def get_depth(self):
+        with self.lock:
+            return self.depth
+
+    def publish(self, frame, hs, prog, status, rate, frames, hands):
         with self.lock:
             self.frame = frame
             self.hs = hs
             self.prog = prog
-            self.home = home
+            self.status = status
             self.rate = rate
             self.frames = frames
             self.hands = hands
 
     def snapshot(self):
         with self.lock:
-            return (self.frame, self.hs, self.prog, self.home, self.rate,
+            return (self.frame, self.hs, self.prog, self.status, self.rate,
                     self.frames, self.hands)
 
 
@@ -62,6 +71,8 @@ def control_loop(cam, static_img, tracker, fist, retarget, tx, shared, duration)
     frames = hands = sent = 0
     last_log = t0
     rate = 0.0
+    lost = 0
+    LOST_RESET = 20      # ~0.25s of no hand -> require a fresh calibration clutch
     while not shared.stop:
         if static_img is not None:
             ts, frame = time.monotonic_ns(), static_img
@@ -74,48 +85,87 @@ def control_loop(cam, static_img, tracker, fist, retarget, tx, shared, duration)
         hs = tracker.process(frame)
         frames += 1
         prog = 0.0
-        home = False
+        status = "no hand"
         if hs:
+            lost = 0
             hands += 1
-            home, prog = fist.update(hs.openness, now)
+            status, prog, just = fist.update(hs, now)
+            g = fist.gripper_value(hs.pinch)     # operator-calibrated 0..1
             if tx:
-                tx.send(retarget.to_eeframe(hs, now, home=home, enabled=True))
+                tx.send(retarget.relative_eeframe(hs, now, tracking=fist.tracking,
+                                                  just_calibrated=just, gripper=g))
                 sent += 1
-        elif tx:
-            tx.send(EEFrame(flags=FLAG_VALID))   # no hand -> hold (deadman off)
-            sent += 1
+        else:
+            lost += 1
+            if lost == LOST_RESET:        # hand gone -> drop tracking + clear origin
+                fist.reset()
+                retarget.notify_hand_lost()
+            if tx:
+                tx.send(EEFrame(flags=FLAG_VALID))   # hold (deadman off)
+                sent += 1
         if now - last_log >= 1.0:
             rate = frames / (now - t0)
             last_log = now
-        shared.publish(frame, hs, prog, home, rate, frames, hands)
+        shared.publish(frame, hs, prog, status, rate, frames, hands)
         if duration and (now - t0) >= duration:
             break
     shared.stop = True
     print(f"control loop done: frames={frames} hands={hands} sent={sent}")
 
 
-def draw(frame, hs, prog, home, rate, cam_name):
+def depth_loop(depther, shared, hz=7.0):
+    """VIEWER-ONLY monocular depth on its own thread (never touches control).
+    Rate-capped so it can't pin CPU cores / cause thermal throttling that would
+    slow the control loop over a long session (review S1)."""
+    period = 1.0 / hz
+    while not shared.stop:
+        t0 = time.perf_counter()
+        frame, *_ = shared.snapshot()
+        if frame is None:
+            time.sleep(0.05)
+            continue
+        try:
+            shared.set_depth(depther.infer(frame, 480, 480))
+        except Exception as e:
+            print("depth thread stopped:", e)
+            break
+        dt = period - (time.perf_counter() - t0)
+        if dt > 0:
+            time.sleep(dt)
+
+
+def draw(frame, hs, prog, status, rate, cam_name):
     col = (0, 255, 0) if hs else (0, 0, 255)
     cv2.putText(frame, f"{cam_name}   HAND: {'YES' if hs else 'NO'}   {rate:.0f}Hz",
                 (12, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.8, col, 2)
     if hs:
         pts = hs.landmarks_px
-        for (x, y) in pts:
-            cv2.circle(frame, (x, y), 4, (0, 255, 0), -1)
-        # simple skeleton for readability
+        for i, (x, y) in enumerate(pts):
+            # highlight the index fingertip (EE reference point) in magenta
+            c = (255, 0, 255) if i == 8 else (0, 255, 0)
+            cv2.circle(frame, (x, y), 6 if i == 8 else 4, c, -1)
         for a, b in [(0, 5), (5, 8), (0, 9), (9, 12), (0, 17), (0, 4), (4, 8)]:
             if a < len(pts) and b < len(pts):
                 cv2.line(frame, pts[a], pts[b], (0, 200, 0), 2)
         cv2.putText(frame, f"grip={hs.gripper:.2f}  open={hs.openness:.2f}  "
-                    f"pos=({hs.pos[0]:+.2f},{hs.pos[1]:+.2f},{hs.pos[2]:+.2f})",
+                    f"tip=({hs.pos[0]:+.2f},{hs.pos[1]:+.2f},{hs.pos[2]:+.2f})",
                     (12, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
     else:
         cv2.putText(frame, "show your RIGHT hand to the camera", (12, 66),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-    if prog > 0:
-        c = (0, 0, 255) if home else (0, 200, 255)
-        cv2.putText(frame, f"FIST->HOME {prog*100:.0f}%", (12, 98),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, c, 2)
+    # calibration state banner
+    if status == "TRACKING":
+        cv2.putText(frame, "TRACKING (index fingertip -> arm)", (12, 98),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    elif status == "STEP2":
+        cv2.putText(frame, f"STEP2: PINCH thumb+index  {prog*100:.0f}%", (12, 98),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
+    elif prog > 0:
+        cv2.putText(frame, f"STEP1: index+thumb OPEN, fold 3 fingers  {prog*100:.0f}%",
+                    (12, 98), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+    elif hs:
+        cv2.putText(frame, "STEP1: index+thumb OPEN, fold other 3 fingers (3s)",
+                    (12, 98), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
 
 
 def main():
@@ -132,6 +182,8 @@ def main():
     ap.add_argument("--hfov", type=float, default=60.0)
     ap.add_argument("--duration", type=float, default=0.0)
     ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--depth", type=int, default=1,
+                    help="1 = show the monocular depth pane (viewer-only, own thread)")
     ap.add_argument("--selftest", action="store_true", help="no network")
     ap.add_argument("--image", default="", help="feed a static image instead of a camera")
     a = ap.parse_args()
@@ -150,7 +202,7 @@ def main():
     tracker = HandTracker(target=a.target, mirror=bool(a.mirror),
                           swap_handedness=bool(a.swap_handedness),
                           xy_gain=a.xy_gain)
-    fist = FistHold()
+    fist = CalibrationFSM()
     retarget = Retargeter()
     tx = None
     if not a.selftest:
@@ -169,12 +221,31 @@ def main():
         else:
             th = threading.Thread(target=control_loop, args=args, daemon=True)
             th.start()
+            # optional depth pane on its OWN thread (viewer-only, zero control cost)
+            if a.depth:
+                try:
+                    from depth_model import DepthAnything
+                    dth = threading.Thread(target=depth_loop,
+                                           args=(DepthAnything(), shared), daemon=True)
+                    dth.start()
+                except Exception as e:
+                    print("depth pane disabled:", e)
             # MAIN thread = GUI only (never gates control -> zero control latency)
+            DH = 540
             while not shared.stop:
-                frame, hs, prog, home, rate, _f, _h = shared.snapshot()
+                frame, hs, prog, status, rate, _f, _h = shared.snapshot()
                 if frame is not None:
                     disp = frame.copy()          # copy so control thread is untouched
-                    draw(disp, hs, prog, home, rate, cam_name)
+                    draw(disp, hs, prog, status, rate, cam_name)
+                    h0, w0 = disp.shape[:2]
+                    dw = int(w0 * DH / h0)
+                    disp = cv2.resize(disp, (dw, DH))
+                    d = shared.get_depth()
+                    if d is not None:
+                        dd = cv2.resize(d, (dw, DH))
+                        cv2.putText(dd, "DEPTH (monocular)", (12, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                        disp = cv2.hconcat([disp, dd])
                     cv2.imshow("vision-teleop", disp)
                 if (cv2.waitKey(15) & 0xFF) == 27:   # ~66 Hz GUI cap, ESC to quit
                     shared.stop = True

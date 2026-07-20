@@ -22,7 +22,10 @@ H="$HOME/vision-teleop"
 PY="$H/mac/.venv/bin/python"
 export PYTHONPATH="$H/mac:$H/proto"
 CMD=${1:-help}
-CAM=${2:-builtin}   # resolve the Mac built-in camera by type, not a fragile index
+CAM=${2:-builtin}   # resolve the Mac built-in camera by identity, not a fragile index
+# zsh (interactive) does NOT treat a trailing '#' as a comment, so `live #` passes
+# '#' as the camera arg. Guard against that / empty -> default to builtin.
+case "$CAM" in ""|\#*) CAM=builtin;; esac
 
 pi_ctrl() { ssh "$PI" "bash ~/vision-teleop/pi/run_controller.sh $1"; }
 
