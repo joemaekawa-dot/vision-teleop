@@ -125,6 +125,7 @@ class HandTracker:
             min_tracking_confidence=min_track)
         self.hands = mp_vision.HandLandmarker.create_from_options(opts)
         self._ts_ms = 0
+        self._last_zn = 0.0     # held depth when the size cue is unreliable (tilt)
 
     def _pick(self, res):
         if not res.hand_landmarks:
@@ -179,6 +180,16 @@ class HandTracker:
         size_px = math.hypot(px[MIDDLE_MCP][0] - px[WRIST][0],
                              px[MIDDLE_MCP][1] - px[WRIST][1])
         zn = self.depth.z_norm(size_px, frame=frame_bgr, uv=(cx, cy))
+        # TILT GATE: apparent size is only a valid depth cue when the wrist->mid-MCP
+        # segment is ~fronto-parallel. When the hand tilts (that segment foreshortens
+        # -> big z-component in world coords), HOLD the last depth so tilt during a
+        # horizontal reach can't leak into the arm's vertical (Z) axis.
+        _seg = W[MIDDLE_MCP] - W[WRIST]
+        _slen = float(np.linalg.norm(_seg)) or 1e-6
+        if abs(_seg[2]) / _slen < 0.5:       # segment within ~30deg of fronto-parallel
+            self._last_zn = zn
+        else:
+            zn = self._last_zn
 
         # --- pinch, per-finger extension, openness from world coords ---
         hand_scale = np.linalg.norm(W[MIDDLE_MCP] - W[WRIST]) or 1e-3

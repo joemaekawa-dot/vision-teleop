@@ -69,11 +69,20 @@ def clamp_target(x, y, z, ee_pitch, margin=0.99):
     d = math.hypot(rw, zw)
     dmax = (L1 + L2) * margin
     dmin = abs(L1 - L2) + 0.01
-    if d > 1e-6:
-        d2 = min(dmax, max(dmin, d))
-        if d2 != d:
-            rw *= d2 / d
-            zw *= d2 / d
+    if d > dmax:
+        # Over-reach: keep the commanded HEIGHT (zw) and pull in only the RADIUS
+        # (rw), so a purely horizontal over-push does NOT drop/raise Z. Only if the
+        # height alone exceeds reach do we fall back to uniform scaling.
+        if abs(zw) < dmax - 1e-6:
+            rw = math.copysign(math.sqrt(dmax * dmax - zw * zw), rw if rw else 1.0)
+        else:
+            s = dmax / d
+            rw *= s
+            zw *= s
+    elif 1e-6 < d < dmin:
+        s = dmin / d
+        rw *= s
+        zw *= s
     r2 = rw + L3 * math.cos(ee_pitch)
     z2 = zw + L3 * math.sin(ee_pitch) + BASE_H
     return (r2 * math.cos(pan), r2 * math.sin(pan), z2)

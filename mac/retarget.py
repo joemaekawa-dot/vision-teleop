@@ -25,7 +25,8 @@ from eeframe import EEFrame, FLAG_VALID, FLAG_ENABLED, FLAG_HOME, FLAG_CALIBRATE
 REACH_HALF = 0.16   # m horizontal half-extent; generous so full hand travel reaches
 VERT_HALF = 0.12    # the arm's limit, where the Pi clamp saturates it (max range)
 SGN_X, SGN_Y, SGN_Z = +1.0, +1.0, -1.0   # live-tunable signs
-DEPTH_DEAD = 0.18   # normalized depth deadband: small hand-size wobble -> no vertical
+DEPTH_DEAD = 0.30   # normalized depth deadband: reject hand-size wobble/tilt leak
+                    # (widened — size-based depth is not horizontal-invariant)
 
 
 def _c1(v):
