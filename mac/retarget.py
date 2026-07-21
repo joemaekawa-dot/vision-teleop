@@ -25,8 +25,9 @@ from eeframe import EEFrame, FLAG_VALID, FLAG_ENABLED, FLAG_HOME, FLAG_CALIBRATE
 REACH_HALF = 0.16   # m horizontal half-extent; generous so full hand travel reaches
 VERT_HALF = 0.12    # the arm's limit, where the Pi clamp saturates it (max range)
 SGN_X, SGN_Y, SGN_Z = +1.0, +1.0, -1.0   # live-tunable signs
-DEPTH_DEAD = 0.30   # normalized depth deadband: reject hand-size wobble/tilt leak
-                    # (widened — size-based depth is not horizontal-invariant)
+DEPTH_DEAD = 0.12   # deadband on the (now orientation-invariant) scene-depth signal
+DEPTH_GAIN = 1.2    # raw Depth-Anything units -> normalized (measured raw span ~0.2..3.6);
+                    # a ~20cm in/out push ~= 1 unit -> full range. Live-tune with f/g keys.
 
 
 def _c1(v):
@@ -76,9 +77,11 @@ class Retargeter:
         self._fz = OneEuro(mincutoff=1.7, beta=0.05)
         self._fg = OneEuro(mincutoff=2.0, beta=0.01)
         self._q = None
-        self._ref = None   # calibrated origin (index-MCP screen pos)
+        self._ref = None    # calibrated origin (index-MCP screen pos) for X,Y
+        self._ref_z = None  # calibrated origin (scene depth at index MCP) for Z
         # live-tunable axis signs (flip at runtime with the x/y/z keys)
         self.sgn_x, self.sgn_y, self.sgn_z = SGN_X, SGN_Y, SGN_Z
+        self.depth_gain = DEPTH_GAIN
 
     def flip(self, axis: str):
         if axis == "x":
@@ -91,25 +94,33 @@ class Retargeter:
     def signs(self):
         return (self.sgn_x, self.sgn_y, self.sgn_z)
 
-    def relative_eeframe(self, hs, t_s, tracking: bool,
-                         just_calibrated: bool, gripper: float) -> EEFrame:
-        """RELATIVE IK path. EE delta (m, base frame) from the INDEX-FINGERTIP
-        screen offset since calibration, scaled to the arm's reach (max planar
-        range). `gripper` is the operator-calibrated 0..1 opening. A depth
-        deadzone keeps small size wobble from drifting the vertical axis, so
-        horizontal hand motion stays PARALLEL to the floor."""
-        p = hs.pos                       # (screen-x, screen-y, size-depth) ~[-1,1]
+    def bump_depth_gain(self, factor):
+        self.depth_gain = max(0.5, min(80.0, self.depth_gain * factor))
+
+    def relative_eeframe(self, hs, t_s, tracking: bool, just_calibrated: bool,
+                         gripper: float, depth_mcp=None) -> EEFrame:
+        """RELATIVE IK path. X,Y = index-MCP screen offset since calibration scaled
+        to reach. Z = MONOCULAR SCENE DEPTH at the index MCP (`depth_mcp`, raw Depth
+        Anything value) relative to calibration — invariant to palm orientation and
+        lateral shift, so horizontal motion / hand tilt no longer move Z."""
+        p = hs.pos                       # (screen-x, screen-y, [unused size-z])
         if just_calibrated or self._ref is None:
-            self._ref = p                # capture origin ("1")
+            self._ref = p                # capture X,Y origin ("1")
+            self._ref_z = depth_mcp      # capture Z origin (may be None if not ready)
+        if self._ref_z is None and depth_mcp is not None:
+            self._ref_z = depth_mcp      # late Z origin once depth becomes available
         g = self._fg(gripper, t_s)
         if not tracking:
             return EEFrame(gripper=g, confidence=hs.confidence, flags=FLAG_VALID)
         dx = _c1(p[0] - self._ref[0])    # screen offset, clipped -> predictable max range
         dy = _c1(p[1] - self._ref[1])
-        dz = _deadzone(_c1(p[2] - self._ref[2]), DEPTH_DEAD)  # ignore small depth wobble
+        if depth_mcp is not None and self._ref_z is not None:
+            dz = _deadzone(_c1((depth_mcp - self._ref_z) * self.depth_gain), DEPTH_DEAD)
+        else:
+            dz = 0.0                     # depth not ready -> hold Z (no guessing)
         ee_x = self._fx(self.sgn_x * dy * REACH_HALF, t_s)  # screen up/down -> fwd/back (X)
         ee_y = self._fy(self.sgn_y * dx * REACH_HALF, t_s)  # screen L/R     -> L/R (Y)
-        ee_z = self._fz(self.sgn_z * dz * VERT_HALF, t_s)   # closer         -> DOWN (-Z)
+        ee_z = self._fz(self.sgn_z * dz * VERT_HALF, t_s)   # nearer         -> DOWN (-Z)
         return EEFrame(pos=(ee_x, ee_y, ee_z), gripper=g, confidence=hs.confidence,
                        flags=FLAG_VALID | FLAG_ENABLED | FLAG_CALIBRATED)
 
@@ -117,6 +128,7 @@ class Retargeter:
         """Invalidate the calibrated origin so a re-acquired hand re-seats it
         instead of producing a violent jump from a stale origin (review CRIT-1)."""
         self._ref = None
+        self._ref_z = None
 
     def to_eeframe(self, hs, t_s, home=False, enabled=True) -> EEFrame:
         x = self._fx(hs.pos[0], t_s)

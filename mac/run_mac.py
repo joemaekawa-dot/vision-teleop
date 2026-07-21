@@ -39,7 +39,9 @@ class Shared:
         self.rate = 0.0
         self.frames = 0
         self.hands = 0
-        self.depth = None      # colourised depth map (BGR), from the depth thread
+        self.depth = None          # colourised depth map (BGR), from the depth thread
+        self.mcp_px = None         # latest index-MCP pixel (u,v), from control thread
+        self.depth_at_mcp = None   # RAW scene depth at the index MCP, from depth thread
         self.stop = False
 
     def set_depth(self, d):
@@ -49,6 +51,22 @@ class Shared:
     def get_depth(self):
         with self.lock:
             return self.depth
+
+    def set_mcp(self, uv):
+        with self.lock:
+            self.mcp_px = uv
+
+    def get_mcp(self):
+        with self.lock:
+            return self.mcp_px
+
+    def set_depth_at_mcp(self, z):
+        with self.lock:
+            self.depth_at_mcp = z
+
+    def get_depth_at_mcp(self):
+        with self.lock:
+            return self.depth_at_mcp
 
     def publish(self, frame, hs, prog, status, rate, frames, hands):
         with self.lock:
@@ -89,11 +107,14 @@ def control_loop(cam, static_img, tracker, fist, retarget, tx, shared, duration)
         if hs:
             lost = 0
             hands += 1
+            if len(hs.landmarks_px) > 5:
+                shared.set_mcp(hs.landmarks_px[5])   # index-MCP pixel -> depth thread
             status, prog, just = fist.update(hs, now)
             g = fist.gripper_value(hs.pinch)     # operator-calibrated 0..1
             if tx:
                 tx.send(retarget.relative_eeframe(hs, now, tracking=fist.tracking,
-                                                  just_calibrated=just, gripper=g))
+                                                  just_calibrated=just, gripper=g,
+                                                  depth_mcp=shared.get_depth_at_mcp()))
                 sent += 1
         else:
             lost += 1
@@ -114,9 +135,10 @@ def control_loop(cam, static_img, tracker, fist, retarget, tx, shared, duration)
 
 
 def depth_loop(depther, shared, hz=7.0):
-    """VIEWER-ONLY monocular depth on its own thread (never touches control).
-    Rate-capped so it can't pin CPU cores / cause thermal throttling that would
-    slow the control loop over a long session (review S1)."""
+    """Own-thread monocular depth (never blocks control). Produces the viewer map
+    AND samples RAW scene depth at the index-MCP pixel for the vertical (Z) axis
+    -> Z is invariant to palm orientation / lateral shift. Rate-capped so it can't
+    pin cores / thermally throttle the control loop."""
     period = 1.0 / hz
     while not shared.stop:
         t0 = time.perf_counter()
@@ -125,7 +147,12 @@ def depth_loop(depther, shared, hz=7.0):
             time.sleep(0.05)
             continue
         try:
-            shared.set_depth(depther.infer(frame, 480, 480))
+            raw = depther.infer_raw(frame)
+            shared.set_depth(depther.colorize(raw, 480, 480))       # viewer pane
+            mcp = shared.get_mcp()                                   # control Z
+            if mcp is not None:
+                h0, w0 = frame.shape[:2]
+                shared.set_depth_at_mcp(depther.sample(raw, mcp[0], mcp[1], w0, h0))
         except Exception as e:
             print("depth thread stopped:", e)
             break
@@ -215,21 +242,21 @@ def main():
           f"mode={'selftest' if a.selftest else 'live-tx'} "
           f"gui={'off' if a.headless else 'on'}")
 
+    # depth thread (own thread, CPU): viewer pane + orientation-invariant Z at the
+    # index MCP. Runs in BOTH headless and GUI so live teleop always has vertical.
+    if a.depth:
+        try:
+            from depth_model import DepthAnything
+            threading.Thread(target=depth_loop, args=(DepthAnything(), shared),
+                             daemon=True).start()
+        except Exception as e:
+            print("depth disabled:", e)
     try:
         if a.headless:
             control_loop(*args)                 # no GUI: run control in this thread
         else:
             th = threading.Thread(target=control_loop, args=args, daemon=True)
             th.start()
-            # optional depth pane on its OWN thread (viewer-only, zero control cost)
-            if a.depth:
-                try:
-                    from depth_model import DepthAnything
-                    dth = threading.Thread(target=depth_loop,
-                                           args=(DepthAnything(), shared), daemon=True)
-                    dth.start()
-                except Exception as e:
-                    print("depth pane disabled:", e)
             # MAIN thread = GUI only (never gates control -> zero control latency)
             DH = 540
             while not shared.stop:
@@ -247,8 +274,9 @@ def main():
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                         disp = cv2.hconcat([disp, dd])
                     sx, sy, sz = retarget.signs()
-                    sgn = f"signs X{'+' if sx > 0 else '-'} Y{'+' if sy > 0 else '-'} Z{'+' if sz > 0 else '-'}"
-                    cv2.putText(disp, f"{sgn}   (x/y/z flip axis, ESC quit)",
+                    sgn = f"X{'+' if sx > 0 else '-'} Y{'+' if sy > 0 else '-'} Z{'+' if sz > 0 else '-'}"
+                    cv2.putText(disp, f"signs {sgn}  Zgain={retarget.depth_gain:.1f}"
+                                f"   (x/y/z flip, f/g Zgain, ESC)",
                                 (12, disp.shape[0] - 14), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.55, (0, 255, 255), 2)
                     cv2.imshow("vision-teleop", disp)
@@ -257,6 +285,10 @@ def main():
                     shared.stop = True
                 elif k in (ord('x'), ord('y'), ord('z')):
                     retarget.flip(chr(k))            # live-flip an axis direction
+                elif k == ord('g'):
+                    retarget.bump_depth_gain(1.25)   # more vertical per hand push
+                elif k == ord('f'):
+                    retarget.bump_depth_gain(0.8)
             th.join(timeout=2)
     finally:
         shared.stop = True
